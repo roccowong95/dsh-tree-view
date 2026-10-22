@@ -40,13 +40,18 @@ test('Better Sidebar is optional, supports late activation and disposes its regi
   assert.equal(fiber.state, 2, 'disabling Better Sidebar does not disable standalone Tree');
 });
 
-async function mount(t, { archived = false, holdNavigation = false } = {}) {
+async function mount(t, { archived = false, holdNavigation = false, delayedSurface = false, legacyController = false, openError = null, eagerSubscription = false } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body><button role="tab" aria-selected="true">Chat</button><div id="root"></div></body></html>', { url: 'https://tree.test/', pretendToBeVisual: true });
   let current = 'root';
+  let ready = 'root';
+  let attempts = 0;
+  const mountedListeners = new Set();
+  const select = id => { current = id; if (!delayedSurface) ready = id; mountedListeners.forEach(f => f()); };
   let requests = 0;
   const opened = [], restored = [], sidebarOpened = [], posts = [], disposers = [];
   const versions = [
     { sessionId: 'root', current: true, createdAt: 1, turns: [{ turn: 1, text: 'Root', time: 1 }] },
+    { sessionId: 'other', parentSessionId: 'root', operation: 'edit', targetTurn: 1, createdAt: 3, turns: [{ turn: 1, text: 'Other', time: 3 }] },
     { sessionId: 'branch', parentSessionId: 'root', operation: 'edit', targetTurn: 1, createdAt: 2, archived, turns: [{ turn: 1, text: 'Branch', time: 2 }] },
   ];
   dom.window.fetch = async (_url, options) => {
@@ -67,8 +72,10 @@ async function mount(t, { archived = false, holdNavigation = false } = {}) {
   const services = {
     slots: { inject: (_name, f) => f(), register: (spec, component) => { if (spec.name === 'conversation.view') fullView = component; return () => {}; } },
     sessions: { list: { subscribe: () => () => {}, getSnapshot: () => ({ byId: Object.fromEntries(versions.map(v => [v.sessionId, { id: v.sessionId, retainedBy: v.sessionId === current ? ['main'] : [] }])) }) } },
-    uiWorkspace: { unarchiveSession: async id => { restored.push(id); }, openSession: id => { opened.push(id); if (!holdNavigation) current = id; } },
-    betterSidebar: { registerTab: value => { tab = value; return () => { tab = null; }; }, openTab: (seed, scope) => sidebarOpened.push({ seed, scope }) },
+    uiWorkspace: { unarchiveSession: async id => { restored.push(id); }, openSession: id => { opened.push(id); if (!holdNavigation) select(id); } },
+    sidebarRight: { mounted: { getSnapshot: () => current, subscribe: f => { mountedListeners.add(f); if (eagerSubscription) f(); return () => mountedListeners.delete(f); } },
+      ...(!legacyController ? { commandTarget: () => ready === current ? { sessionId: current } : undefined } : {}) },
+    betterSidebar: { registerTab: value => { tab = value; return () => { tab = null; }; }, openTab: (seed, scope) => { attempts++; if (openError) throw new Error(openError); if (ready !== current) throw new Error('sidebarRight: no session surface is mounted'); sidebarOpened.push({ seed, scope }); } },
   };
   const ctx = { get: name => services[name], inject: (_deps, f) => f(ctx), effect: f => { const d = f(); if (typeof d === 'function') disposers.push(d); } };
   plugin.apply(ctx);
@@ -89,7 +96,8 @@ async function mount(t, { archived = false, holdNavigation = false } = {}) {
     });
   };
   const renderFull = async () => act(async () => { root.render(React.createElement(fullView, { sessionId: 'root' })); await tick(); });
-  return { dom, render, renderFull, click, setMain: id => { current = id; }, opened, restored, sidebarOpened, posts, requests: () => requests };
+  return { dom, render, renderFull, click, setMain: select, mountSurface: id => { ready = id; }, attempts: () => attempts, listeners: () => mountedListeners.size,
+    disable: () => disposers.splice(0).reverse().forEach(f => f()), unmount: async () => act(async () => root.render(null)), opened, restored, sidebarOpened, posts, requests: () => requests };
 }
 
 test('sidebar reuses the graph, stays dormant while hidden and remounts on session change', async t => {
@@ -167,4 +175,135 @@ test('an unfinished or superseded navigation cannot reveal the destination sideb
   h.setMain('root');
   await act(async () => { await new Promise(resolve => setTimeout(resolve, 3200)); });
   assert.deepEqual(h.sidebarOpened, [], 'timeout must not open Tree for an inactive target');
+});
+
+const frames = async () => act(async () => { await new Promise(resolve => setTimeout(resolve, 55)); });
+
+test('a selected destination waits for its adopted surface, not just mounted selection', async t => {
+  const h = await mount(t, { delayedSurface: true });
+  await h.render(true);
+  await h.click('branch');
+  await frames();
+  assert.equal(h.attempts(), 0, 'do not enqueue an open before a surface exists');
+  assert.equal(h.listeners(), 1);
+  h.mountSurface('branch');
+  await frames();
+  assert.equal(h.sidebarOpened.length, 1);
+  assert.equal(h.listeners(), 0);
+});
+
+test('rapid A to B navigation cancels the pending A handoff', async t => {
+  const h = await mount(t, { delayedSurface: true });
+  await h.render(true);
+  await h.click('branch');
+  await h.click('other');
+  h.mountSurface('other');
+  await frames();
+  assert.deepEqual(h.sidebarOpened.map(x => x.scope.sessionId), ['other']);
+  assert.equal(h.listeners(), 0);
+});
+
+test('leaving a selected destination cancels instead of reopening it on return', async t => {
+  const h = await mount(t, { delayedSurface: true });
+  await h.render(true);
+  await h.click('branch');
+  h.setMain(undefined); // a global panel replaces the conversation
+  h.setMain('branch');
+  h.mountSurface('branch');
+  await frames();
+  assert.deepEqual(h.sidebarOpened, []);
+  assert.equal(h.listeners(), 0);
+});
+
+test('disabling the integration cancels a delayed handoff and releases observers', async t => {
+  const h = await mount(t, { delayedSurface: true });
+  await h.render(true);
+  await h.click('branch');
+  h.disable();
+  h.mountSurface('branch');
+  await frames();
+  assert.deepEqual(h.sidebarOpened, []);
+  assert.equal(h.listeners(), 0);
+});
+
+test('source unmount on session switch preserves handoff; destination unmount cancels it', async t => {
+  const h = await mount(t, { delayedSurface: true });
+  await h.render(true);
+  await h.click('branch');
+  await h.unmount(); // old source view leaves as target is selected
+  assert.equal(h.listeners(), 1);
+  await h.render(true, 'branch');
+  await h.unmount(); // explicitly close the destination tree before ready
+  h.mountSurface('branch');
+  await frames();
+  assert.deepEqual(h.sidebarOpened, []);
+  assert.equal(h.listeners(), 0);
+});
+
+test('legacy controllers retry only the known pre-adoption failure', async t => {
+  const h = await mount(t, { delayedSurface: true, legacyController: true });
+  await h.render(true);
+  await h.click('branch');
+  assert.ok(h.attempts() >= 1);
+  assert.deepEqual(h.sidebarOpened, []);
+  h.mountSurface('branch');
+  await frames();
+  assert.equal(h.sidebarOpened.length, 1);
+});
+
+test('unexpected sidebar errors are terminal and visible, not silently retried', async t => {
+  const h = await mount(t, { openError: 'unknown tab type' });
+  await h.render(true);
+  await h.click('branch');
+  await frames();
+  assert.equal(h.attempts(), 1);
+  assert.match(h.dom.window.document.querySelector('[role="alert"]').textContent, /unknown tab type/);
+  assert.equal(h.listeners(), 0);
+});
+
+test('an unavailable surface reaches a finite, visible deadline and releases observers', async t => {
+  const h = await mount(t, { delayedSurface: true });
+  await h.render(true);
+  await h.click('branch');
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 5100)); });
+  assert.equal(h.attempts(), 0);
+  assert.match(h.dom.window.document.querySelector('[role="alert"]').textContent, /5/);
+  assert.equal(h.listeners(), 0);
+  h.mountSurface('branch');
+  await frames();
+  assert.deepEqual(h.sidebarOpened, []);
+});
+
+test('an eagerly notifying mounted observable cannot leak its subscription', async t => {
+  const h = await mount(t, { eagerSubscription: true });
+  await h.render(true);
+  await h.click('branch');
+  await frames();
+  assert.equal(h.sidebarOpened.length, 1);
+  assert.equal(h.listeners(), 0);
+});
+
+test('hiding the destination while waiting cancels the handoff', async t => {
+  const h = await mount(t, { delayedSurface: true });
+  await h.render(true);
+  await h.click('branch');
+  await h.render(false, 'branch');
+  h.mountSurface('branch');
+  await frames();
+  assert.deepEqual(h.sidebarOpened, []);
+  assert.equal(h.listeners(), 0);
+});
+
+test('main to A, A to B, and B back to main follow each newly mounted surface', async t => {
+  const h = await mount(t, { delayedSurface: true });
+  await h.render(true);
+  for (const destination of ['branch', 'other', 'root']) {
+    await h.click(destination);
+    await h.render(true, destination);
+    h.mountSurface(destination);
+    await frames();
+    assert.equal(h.sidebarOpened.at(-1)?.scope.sessionId, destination);
+    assert.equal(h.listeners(), 0);
+  }
+  assert.deepEqual(h.sidebarOpened.map(x => x.scope.sessionId), ['branch', 'other', 'root']);
 });

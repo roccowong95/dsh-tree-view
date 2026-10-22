@@ -1985,7 +1985,9 @@ const CSS = [
   // edges. Cursor communicates state: grab on canvas, pointer on cards.
   '.mtx-graph{position:relative;height:100%;overflow:hidden;cursor:grab;background-image:radial-gradient(color-mix(in srgb,var(--dsw-alias-label-tertiary,#888) 22%,transparent) 1px,transparent 1px);background-size:26px 26px;touch-action:none;user-select:none}',
   '.mtx-graph[data-panning]{cursor:grabbing}',
-  '.mtx-sidebar-tree{height:100%;min-height:0;min-width:0;overflow:hidden}',
+  '.mtx-sidebar-tree{position:relative;height:100%;min-height:0;min-width:0;overflow:hidden}',
+  '.mtx-sidebar-error{position:absolute;left:8px;right:8px;bottom:8px;z-index:5;padding:8px;border-radius:8px;background:var(--dsw-alias-bg-layer-2,#fff);color:var(--dsw-alias-label-primary,#222);font-size:12px}',
+  '.mtx-sidebar-error button{float:right;cursor:pointer}',
   '.mtx-graph[data-compact] .mtx-graph-tools{top:8px;right:8px;left:8px;justify-content:flex-end;flex-wrap:wrap;gap:4px}',
   '.mtx-graph[data-compact] .mtx-tool{width:28px;height:28px}',
   '.mtx-world{position:absolute;left:0;top:0}',
@@ -2245,6 +2247,9 @@ return {
         branch: 'Branch',
         refresh: 'Refresh',
         fit: 'Center view',
+        sidebarUnavailable: 'Tree could not follow this session: the sidebar readiness service is unavailable. Open Tree from the sidebar + menu.',
+        sidebarFailed: 'Could not open Tree in the destination sidebar',
+        sidebarTimeout: 'The destination sidebar did not become ready within 5 seconds. Open Tree from its + menu to retry.',
         empty: 'No versions yet — edit any of your messages to branch this conversation. Drag to pan, scroll to zoom.',
         images: '{count} image(s) kept as-is',
         nav: 'TreeView',
@@ -2316,6 +2321,9 @@ return {
         branch: '分支',
         refresh: '刷新',
         fit: '居中显示',
+        sidebarUnavailable: '侧栏就绪服务不可用，Tree 未能跟随此会话。请从侧栏 + 菜单打开。',
+        sidebarFailed: '无法在目标侧栏打开 Tree',
+        sidebarTimeout: '目标侧栏在 5 秒内未就绪。请从它的 + 菜单重新打开 Tree。',
         empty: '还没有版本——编辑任意一条你的消息即可创建分支。拖动平移，滚轮缩放。',
         images: '{count} 张图片将原样保留',
         nav: 'TreeView',
@@ -3401,12 +3409,13 @@ return {
         // the app has switched. Ask the app instead — the session list marks what
         // the main view is retaining — and fall back to the prop where that signal
         // does not exist.
+        const revealSidebar = props.prepareSidebarReveal ? props.prepareSidebarReveal(v.sessionId) : null;
         const onScreen = sessions.mainSession ? sessions.mainSession() : null;
         const alreadyOnScreen = onScreen !== null ? v.sessionId === onScreen : v.sessionId === sessionId;
         if (alreadyOnScreen) {
           remoteLog('info', 'click: already on screen (' + (onScreen !== null ? 'app says ' + onScreen : 'prop') + ') — no switch');
           showChat();
-          if (props.onReveal) props.onReveal(v.sessionId);
+          if (revealSidebar) revealSidebar();
           if (typeof node.turn === 'number' && node.turn > 0) jumpToTurn(node.sessionId, node.turn);
           return;
         }
@@ -3425,7 +3434,7 @@ return {
           const current = sessions.mainSession ? sessions.mainSession() : null;
           if (current !== null && current !== v.sessionId) return;
           showChat();
-          if (props.onReveal) props.onReveal(v.sessionId);
+          if (revealSidebar) revealSidebar();
           if (typeof node.turn === 'number' && node.turn > 0) jumpToTurn(node.sessionId, node.turn);
         };
         if (sessions.whenMain) sessions.whenMain(v.sessionId, reveal);
@@ -4106,25 +4115,132 @@ return {
       const sidebar = scope.get('betterSidebar');
       if (!sidebar || typeof sidebar.registerTab !== 'function') return;
       let active = true;
-      scope.effect(function () { return function () { active = false; }; });
+      let generation = 0;
+      let pending = null;
+      let handoffError = '';
+      const errorListeners = new Set();
+      const g = realGlobal();
+      function publishError(message) {
+        handoffError = message;
+        errorListeners.forEach(function (listener) { listener(); });
+        if (message) remoteLog('warn', message);
+      }
+      function cancelPending() {
+        if (!pending) return;
+        const request = pending;
+        pending = null;
+        if (request.frame) g.cancelAnimationFrame(request.frame);
+        clearTimeout(request.timer);
+        if (request.unsubscribe) request.unsubscribe();
+      }
+      // mounted means selected, NOT store-ready in DSH 0.2.1. React adopts
+      // the destination store later. commandTarget(null) is a feature-detected, read-only
+      // readiness probe: it returns no target until a surface really exists.
+      // Observe selection changes, then check readiness on rendering frames.
+      // The deadline only bounds failure; it is never a guessed mount delay.
+      function beginHandoff(sessionId, token) {
+        if (!active || token !== generation) return;
+        const controller = scope.get('sidebarRight');
+        const mounted = controller && controller.mounted;
+        if (!mounted || typeof mounted.getSnapshot !== 'function' || typeof mounted.subscribe !== 'function') {
+          publishError(t('sidebarUnavailable'));
+          return;
+        }
+        const request = { sessionId: sessionId, frame: 0, timer: 0, unsubscribe: null };
+        pending = request;
+        const selected = mounted.getSnapshot();
+        let reached = selected === sessionId;
+        function fail(message) { cancelPending(); publishError(message); }
+        function check() {
+          request.frame = 0;
+          if (!active || token !== generation || pending !== request) return;
+          const current = mounted.getSnapshot();
+          if (current === sessionId) reached = true;
+          // Once selected, leaving that session (including a global panel)
+          // cancels the intent. Never queue a future surprise open in another
+          // session through Better Sidebar's own unbounded pending queue.
+          if ((reached && current !== sessionId) || (current !== selected && current !== sessionId)) {
+            cancelPending();
+            return;
+          }
+          if (current === sessionId) {
+            try {
+              const ready = typeof controller.commandTarget !== 'function'
+                || controller.commandTarget(null)?.sessionId === sessionId;
+              if (ready) {
+                sidebar.openTab({ type: SIDEBAR_TAB_ID, title: t('view'), target: 'right' }, { sessionId: sessionId });
+                cancelPending();
+                return;
+              }
+            } catch (error) {
+              // Older controllers may have no readiness probe. Only this
+              // known pre-adoption error is retryable; unrelated failures are
+              // visible and terminal, never swallowed or retried indefinitely.
+              if (!error || error.message !== 'sidebarRight: no session surface is mounted') {
+                fail(t('sidebarFailed') + ': ' + (error && error.message ? error.message : String(error)));
+                return;
+              }
+            }
+          }
+          request.frame = g.requestAnimationFrame(check);
+        }
+        request.timer = setTimeout(function () {
+          if (pending === request) fail(t('sidebarTimeout'));
+        }, 5000);
+        const unsubscribe = mounted.subscribe(function () {
+          if (pending !== request) return;
+          if (request.frame) g.cancelAnimationFrame(request.frame);
+          check();
+        });
+        request.unsubscribe = unsubscribe;
+        // Some observables eagerly notify subscribe(). That callback may have
+        // already completed/cancelled the request before we got its disposer.
+        if (pending !== request) { unsubscribe(); return; }
+        if (request.frame) g.cancelAnimationFrame(request.frame);
+        check();
+      }
+      scope.effect(function () { return function () {
+        active = false;
+        generation++;
+        cancelPending();
+        errorListeners.clear();
+      }; });
       function SidebarTree(props) {
+        const [, redraw] = React.useReducer(function (x) { return x + 1; }, 0);
+        React.useEffect(function () {
+          errorListeners.add(redraw);
+          return function () { errorListeners.delete(redraw); };
+        }, []);
+        const owner = props.scope && props.scope.sessionId;
+        React.useEffect(function () {
+          function cancelIfOwnerStillSelected() {
+            // A source canvas unmount during a successful cross-session switch
+            // is expected. Closing/hiding it while still on that session is not.
+            const controller = scope.get('sidebarRight');
+            const current = controller && controller.mounted && controller.mounted.getSnapshot();
+            if (current === owner) { generation++; cancelPending(); }
+          }
+          if (!props.visible) cancelIfOwnerStillSelected();
+          return cancelIfOwnerStillSelected;
+        }, [owner, props.visible]);
         // Unmount the canvas while hidden: its existing effect cleanup releases
         // animation frames, observers and listeners. The shared treeStore keeps
         // the data warm without a second cache or background polling loop.
-        if (!props.visible || !props.scope || !props.scope.sessionId) return null;
+        if (!props.visible || !owner) return null;
         return React.createElement('div', { className: 'mtx-sidebar-tree' },
+          handoffError ? React.createElement('div', { className: 'mtx-sidebar-error', role: 'alert' },
+            handoffError, React.createElement('button', { type: 'button', onClick: function () { publishError(''); } }, '×')) : null,
           React.createElement(VersionsView, {
-            key: props.scope.sessionId,
-            sessionId: props.scope.sessionId,
+            key: owner,
+            sessionId: owner,
             compact: true,
-            onReveal: function (sessionId) {
-              if (!active || sessionId === props.scope.sessionId) return;
-              // Right-sidebar tabs belong to a session. Open the same tab in
-              // the destination only once the normal archive/navigation flow
-              // has reached it; never navigate the main session from here.
-              if (typeof sidebar.openTab === 'function') {
-                sidebar.openTab({ type: SIDEBAR_TAB_ID, title: t('view'), target: 'right' }, { sessionId: sessionId });
-              }
+            prepareSidebarReveal: function (sessionId) {
+              const token = ++generation;
+              cancelPending();
+              publishError('');
+              return function () {
+                if (sessionId !== owner) beginHandoff(sessionId, token);
+              };
             },
           })
         );
