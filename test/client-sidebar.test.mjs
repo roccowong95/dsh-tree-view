@@ -41,7 +41,7 @@ test('Better Sidebar is optional, supports late activation and disposes its regi
   assert.equal(fiber.state, 2, 'disabling Better Sidebar does not disable standalone Tree');
 });
 
-async function mount(t, { archived = false, holdNavigation = false, delayedSurface = false, legacyController = false, openError = null, eagerSubscription = false, deferredUnarchive = false, staleRetention = false, holdCatalogue = false, unarchiveError = null } = {}) {
+async function mount(t, { archived = false, holdNavigation = false, delayedSurface = false, legacyController = false, openError = null, eagerSubscription = false, deferredUnarchive = false, staleRetention = false, holdCatalogue = false, unarchiveError = null, statefulArchive = false, delayedTreeCache = false, runningBranch = false, staleSourceArchive = false, archivePhase = 'ready', nativeArchiveFeed = true } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body><button role="tab" aria-selected="true">Chat</button><div id="root"></div></body></html>', { url: 'https://tree.test/', pretendToBeVisual: true });
   let current = 'root';
   let ready = 'root';
@@ -53,6 +53,8 @@ async function mount(t, { archived = false, holdNavigation = false, delayedSurfa
   const addCatalogue = id => { catalogued.add(id); listListeners.forEach(f => f()); };
   const mountedListeners = new Set();
   const select = id => { current = id; if (!delayedSurface) ready = id; mountedListeners.forEach(f => f()); };
+  const archiveState = new Set(archived ? ['branch'] : []);
+  let cachedTree;
   let requests = 0;
   const opened = [], restored = [], sidebarOpened = [], posts = [], disposers = [];
   const versions = [
@@ -61,9 +63,16 @@ async function mount(t, { archived = false, holdNavigation = false, delayedSurfa
     { sessionId: 'branch', parentSessionId: 'root', operation: 'edit', targetTurn: 1, createdAt: 2, archived, turns: [{ turn: 1, text: 'Branch', time: 2 }] },
   ];
   dom.window.fetch = async (_url, options) => {
-    if (options?.method === 'POST') { posts.push(JSON.parse(options.body)); return { ok: true, json: async () => ({ ok: true }) }; }
+    if (options?.method === 'POST') {
+      const op = JSON.parse(options.body); posts.push(op);
+      if (statefulArchive && op.action === 'demote') { archiveState.add(op.sessionId); if (current === op.sessionId) select(undefined); }
+      if (statefulArchive && op.action === 'activate') archiveState.delete(op.sessionId);
+      return { ok: true, json: async () => ({ ok: true }) };
+    }
     requests++;
-    return { ok: true, json: async () => ({ versions }) };
+    const snapshot = statefulArchive ? versions.map(v => ({ ...v, archived: archiveState.has(v.sessionId), running: runningBranch && v.sessionId === 'branch' })) : versions;
+    if (!cachedTree) cachedTree = snapshot;
+    return { ok: true, json: async () => ({ versions: delayedTreeCache ? cachedTree : staleSourceArchive ? snapshot.map(v => v.sessionId === 'branch' ? { ...v, archived: true } : v) : snapshot }) };
   };
   const old = new Map();
   for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, IS_REACT_ACT_ENVIRONMENT: true })) {
@@ -78,7 +87,8 @@ async function mount(t, { archived = false, holdNavigation = false, delayedSurfa
   const services = {
     slots: { inject: (_name, f) => f(), register: (spec, component) => { if (spec.name === 'conversation.view') fullView = component; return () => {}; } },
     sessions: { list: { subscribe: f => { listListeners.add(f); return () => listListeners.delete(f); }, getSnapshot: () => ({ byId: Object.fromEntries(versions.filter(v => catalogued.has(v.sessionId)).map(v => [v.sessionId, { id: v.sessionId, retainedBy: v.sessionId === current ? ['main'] : staleRetention && v.sessionId === 'root' ? ['sidebar'] : [] }])) }) } },
-    uiWorkspace: { unarchiveSession: async id => { restored.push(id); await unarchiveGate; if (unarchiveError) throw new Error(unarchiveError); if (!holdCatalogue) addCatalogue(id); }, openSession: id => { opened.push(id); if (!holdNavigation) select(id); } },
+    uiWorkspace: { unarchiveSession: async id => { restored.push(id); await unarchiveGate; if (unarchiveError) throw new Error(unarchiveError); if (statefulArchive) archiveState.delete(id); if (!holdCatalogue) addCatalogue(id); }, openSession: id => { opened.push(id); if (!holdNavigation) select(statefulArchive && archiveState.has(id) ? undefined : id); } },
+    ...(statefulArchive && nativeArchiveFeed ? { workspaces: { list: { getSnapshot: () => ({ phase: archivePhase, archivedSessionIds: archivePhase === 'ready' ? [...archiveState] : [] }) } } } : {}),
     sidebarRight: { mounted: { getSnapshot: () => current, subscribe: f => { mountedListeners.add(f); if (eagerSubscription) f(); return () => mountedListeners.delete(f); } },
       ...(!legacyController ? { commandTarget: () => ready === current ? { sessionId: current } : undefined } : {}) },
     betterSidebar: { registerTab: value => { tab = value; return () => { tab = null; }; }, openTab: (seed, scope) => { attempts++; if (openError) throw new Error(openError); if (ready !== current) throw new Error('sidebarRight: no session surface is mounted'); sidebarOpened.push({ seed, scope }); } },
@@ -103,7 +113,7 @@ async function mount(t, { archived = false, holdNavigation = false, delayedSurfa
     });
   };
   const renderFull = async () => act(async () => { root.render(React.createElement(fullView, { sessionId: 'root' })); await tick(); });
-  return { dom, render, renderFull, click, setMain: select, selected: () => current, listObservers: () => listListeners.size, releaseUnarchive: () => releaseUnarchive?.(), addCatalogue, mountSurface: id => { ready = id; }, attempts: () => attempts, listeners: () => mountedListeners.size,
+  return { dom, render, renderFull, click, archivedIds: () => [...archiveState], setMain: select, selected: () => current, listObservers: () => listListeners.size, releaseUnarchive: () => releaseUnarchive?.(), addCatalogue, mountSurface: id => { ready = id; }, attempts: () => attempts, listeners: () => mountedListeners.size,
     disable: () => disposers.splice(0).reverse().forEach(f => f()), unmount: async () => act(async () => root.render(null)), opened, restored, sidebarOpened, posts, requests: () => requests };
 }
 
@@ -438,4 +448,55 @@ test('the conversation Tree click path is upstream-identical apart from the opti
   const end = source.indexOf('\n      /**', start);
   const original = source.slice(start, end).replace("        // Only the optional sidebar supplies this adapter. The conversation\n        // Tree below deliberately retains its original navigation semantics.\n        if (props.onVersionSelect) {\n          props.onVersionSelect(v, node, versions, sessionId);\n          return;\n        }\n", '');
   assert.equal(createHash('sha256').update(original).digest('hex'), 'f11dca6994c93aaab42e389a72b8b1b1175410d6edfb7cad42101952dfed2dfc');
+});
+
+for (const mode of ['fresh', 'stale source flag', 'delayed tree cache and stale scope']) {
+  test('natural archived A → B → A collects the actual source: ' + mode, async t => {
+    const delayedTreeCache = mode === 'delayed tree cache and stale scope';
+    const h = await mount(t, { archived: true, statefulArchive: true, delayedTreeCache, staleSourceArchive: mode === 'stale source flag' });
+    await h.render(true, 'root');
+    await h.click('branch');
+    assert.equal(h.selected(), 'branch');
+    assert.deepEqual(h.archivedIds(), ['root']);
+    assert.equal(h.sidebarOpened.at(-1).scope.sessionId, 'branch');
+    await h.render(true, delayedTreeCache ? 'root' : 'branch');
+    await h.click('root');
+    assert.equal(h.selected(), 'root', 'collecting the wrong source must not clear the new chat');
+    assert.deepEqual(h.restored, ['branch', 'root']);
+    assert.deepEqual(h.archivedIds(), ['branch']);
+    assert.deepEqual(h.posts.filter(p => p.action === 'demote').map(p => p.sessionId), ['root', 'branch']);
+    assert.equal(h.sidebarOpened.at(-1).scope.sessionId, 'root');
+  });
+}
+
+test('sidebar collection still leaves a running source alone with stale cached archive flags', async t => {
+  const h = await mount(t, { archived: true, statefulArchive: true, delayedTreeCache: true, runningBranch: true });
+  await h.render(true);
+  await h.click('branch');
+  await h.render(true, 'branch');
+  await h.click('root');
+  assert.equal(h.selected(), 'root');
+  assert.deepEqual(h.archivedIds(), []);
+  assert.deepEqual(h.posts.filter(p => p.action === 'demote').map(p => p.sessionId), ['root']);
+});
+
+for (const archivePhase of ['pending', 'disconnected']) {
+  test('a ' + archivePhase + ' native archive feed does not override the tree restore flag', async t => {
+    const h = await mount(t, { archived: true, statefulArchive: true, archivePhase });
+    await h.render(true);
+    await h.click('branch');
+    assert.deepEqual(h.restored, ['branch']);
+    assert.equal(h.selected(), 'branch');
+    assert.deepEqual(h.archivedIds(), ['root']);
+  });
+}
+
+test('legacy host without native archive feed collects selected source despite its stale graph flag', async t => {
+  const h = await mount(t, { archived: true, statefulArchive: true, nativeArchiveFeed: false, staleSourceArchive: true });
+  await h.render(true);
+  await h.click('branch');
+  await h.render(true, 'branch');
+  await h.click('root');
+  assert.equal(h.selected(), 'root');
+  assert.deepEqual(h.archivedIds(), ['branch']);
 });

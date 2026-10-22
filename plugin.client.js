@@ -4221,6 +4221,21 @@ return {
           if (node.turn > 0) jumpToTurn(node.sessionId, node.turn);
           return;
         }
+        // Sidebar scopes/tree payloads can outlive a restore/collection. Use the
+        // native archive snapshot for this click, not an old graph's flags. Only
+        // the confirmed selected source gets the legacy-host fallback; never
+        // clear its running/deleted flags or bypass the common family checks.
+        const workspaces = scope.get('workspaces');
+        const workspaceList = workspaces && workspaces.list;
+        const workspaceSnapshot = workspaceList && typeof workspaceList.getSnapshot === 'function' && workspaceList.getSnapshot();
+        const archiveIds = workspaceSnapshot && (!workspaceSnapshot.phase || workspaceSnapshot.phase === 'ready') && workspaceSnapshot.archivedSessionIds;
+        const nativeArchives = Array.isArray(archiveIds) ? new Set(archiveIds) : null;
+        if (nativeArchives) version = Object.assign({}, version, { archived: nativeArchives.has(version.sessionId) });
+        const collectionVersions = versions.map(function (entry) {
+          return initial && entry.sessionId === initial
+            ? Object.assign({}, entry, { archived: nativeArchives ? nativeArchives.has(initial) : false })
+            : entry;
+        });
         let cancelled = false;
         let reached = false;
         let arrived = false;
@@ -4286,7 +4301,7 @@ return {
             if (!valid() || mounted.getSnapshot() !== version.sessionId) return;
             arrived = true;
             showChat();
-            if (version.archived === true) collectLeftVersion(adapter, initial || owner, version.sessionId, versions);
+            if (version.archived === true) collectLeftVersion(adapter, initial || owner, version.sessionId, collectionVersions);
             beginHandoff(version.sessionId, token);
             if (node.turn > 0) jumpToTurn(node.sessionId, node.turn);
           });
