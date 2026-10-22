@@ -12,6 +12,7 @@
 // upstream name on purpose — see the note in lib/index.js.
 const ROUTE = '/tree-view';
 const VIEW_ORDER = 16;
+const SIDEBAR_TAB_ID = 'dsh-tree-view:tree';
 
 function realGlobal() {
   try { if (typeof window !== 'undefined' && window) return window; } catch (e) {}
@@ -1984,6 +1985,9 @@ const CSS = [
   // edges. Cursor communicates state: grab on canvas, pointer on cards.
   '.mtx-graph{position:relative;height:100%;overflow:hidden;cursor:grab;background-image:radial-gradient(color-mix(in srgb,var(--dsw-alias-label-tertiary,#888) 22%,transparent) 1px,transparent 1px);background-size:26px 26px;touch-action:none;user-select:none}',
   '.mtx-graph[data-panning]{cursor:grabbing}',
+  '.mtx-sidebar-tree{height:100%;min-height:0;min-width:0;overflow:hidden}',
+  '.mtx-graph[data-compact] .mtx-graph-tools{top:8px;right:8px;left:8px;justify-content:flex-end;flex-wrap:wrap;gap:4px}',
+  '.mtx-graph[data-compact] .mtx-tool{width:28px;height:28px}',
   '.mtx-world{position:absolute;left:0;top:0}',
   '.mtx-edges{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}',
   // Branch names ride above the cards, and the marker above them.
@@ -2833,14 +2837,16 @@ return {
       const viewRef = React.useRef({ x: 60, y: 42, scale: 1 });
       // Written down when the view goes away — the host unmounts it on every tab switch —
       // so the position survives leaving the Tree and coming back.
-      const viewMemoryKeyRef = React.useRef(sessionId);
+      // A full page and a narrow sidebar have different coordinate spaces.
+      const viewMemoryKey = (props.compact ? 'sidebar:' : 'conversation:') + sessionId;
+      const viewMemoryKeyRef = React.useRef(viewMemoryKey);
       React.useEffect(function () {
-        viewMemoryKeyRef.current = sessionId;
+        viewMemoryKeyRef.current = viewMemoryKey;
         return function () {
           const view = viewRef.current;
           viewMemory.set(viewMemoryKeyRef.current, { x: view.x, y: view.y, scale: view.scale });
         };
-      }, [sessionId]);
+      }, [viewMemoryKey]);
       const dragRef = React.useRef(null);
       const rafRef = React.useRef(0);
       const fittedRef = React.useRef(false);
@@ -3305,7 +3311,7 @@ return {
           // Coming back to a conversation puts the reader where they left it (see
           // viewMemory); the first visit to a tree frames it, and the toolbar's ⌖ reframes
           // on demand.
-          const remembered = viewMemory.get(sessionId);
+          const remembered = viewMemory.get(viewMemoryKey);
           if (remembered) viewRef.current = { x: remembered.x, y: remembered.y, scale: remembered.scale };
           else fitView();
         } else if (fitAfterLayoutRef.current) {
@@ -3400,6 +3406,7 @@ return {
         if (alreadyOnScreen) {
           remoteLog('info', 'click: already on screen (' + (onScreen !== null ? 'app says ' + onScreen : 'prop') + ') — no switch');
           showChat();
+          if (props.onReveal) props.onReveal(v.sessionId);
           if (typeof node.turn === 'number' && node.turn > 0) jumpToTurn(node.sessionId, node.turn);
           return;
         }
@@ -3413,7 +3420,12 @@ return {
         // this same tick showed the session you were leaving until the switch landed
         // — the report "it flashes the new conversation, then jumps to the target".
         const reveal = function () {
+          // whenMain has a bounded timeout: never reveal a sidebar for a
+          // failed or superseded navigation that did not reach its target.
+          const current = sessions.mainSession ? sessions.mainSession() : null;
+          if (current !== null && current !== v.sessionId) return;
           showChat();
+          if (props.onReveal) props.onReveal(v.sessionId);
           if (typeof node.turn === 'number' && node.turn > 0) jumpToTurn(node.sessionId, node.turn);
         };
         if (sessions.whenMain) sessions.whenMain(v.sessionId, reveal);
@@ -3657,6 +3669,7 @@ return {
 
       return React.createElement('div', {
         className: 'mtx-graph',
+        'data-compact': props.compact ? '' : undefined,
         ref: graphRef,
         onPointerDown: onPointerDown,
         onPointerMove: onPointerMove,
@@ -4083,6 +4096,48 @@ return {
         remoteLog('warn', 'Failed to register the user-message view; editing is unavailable.', e);
         return function () {};
       }
+    });
+
+    // Optional client-only integration. Do not make Better Sidebar a hard
+    // dependency: standalone Tree and message editing must still boot without it.
+    // Cordis re-enters this scope if the service is enabled/replaced later, and
+    // disposes the tab registration when either plugin goes away.
+    ctx.inject(['betterSidebar'], function (scope) {
+      const sidebar = scope.get('betterSidebar');
+      if (!sidebar || typeof sidebar.registerTab !== 'function') return;
+      let active = true;
+      scope.effect(function () { return function () { active = false; }; });
+      function SidebarTree(props) {
+        // Unmount the canvas while hidden: its existing effect cleanup releases
+        // animation frames, observers and listeners. The shared treeStore keeps
+        // the data warm without a second cache or background polling loop.
+        if (!props.visible || !props.scope || !props.scope.sessionId) return null;
+        return React.createElement('div', { className: 'mtx-sidebar-tree' },
+          React.createElement(VersionsView, {
+            key: props.scope.sessionId,
+            sessionId: props.scope.sessionId,
+            compact: true,
+            onReveal: function (sessionId) {
+              if (!active || sessionId === props.scope.sessionId) return;
+              // Right-sidebar tabs belong to a session. Open the same tab in
+              // the destination only once the normal archive/navigation flow
+              // has reached it; never navigate the main session from here.
+              if (typeof sidebar.openTab === 'function') {
+                sidebar.openTab({ type: SIDEBAR_TAB_ID, title: t('view'), target: 'right' }, { sessionId: sessionId });
+              }
+            },
+          })
+        );
+      }
+      scope.effect(function () {
+        return sidebar.registerTab({
+          id: SIDEBAR_TAB_ID,
+          title: function () { return t('view'); },
+          order: VIEW_ORDER,
+          single: true,
+          component: SidebarTree,
+        });
+      });
     });
 
     slots.inject('conversation.view', function () {

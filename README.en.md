@@ -48,6 +48,18 @@ Switch the conversation panel to Tree and the whole family is drawn on one canva
 | 📦 **Archived branches stay** | A version you archive is still drawn, dimmed and marked "archived" — archiving takes an entry out of the sidebar, it does not delete a branch. |
 | 🎨 **Following the theme** | Surface, border, accent, state and even shadow colours come from the host's theme tokens: light follows light, dark follows dark. |
 
+## Optional: Tree in Better Sidebar
+
+With [DSH-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) enabled, choose **Tree** from the right sidebar's `+` menu. No Better Sidebar patch is needed. This does not replace the left session list, and the original full-size conversation Tree tab remains available.
+
+- Both surfaces share the graph, cache, filters and branch actions; there is no second session store.
+- Selecting a node opens its chat in the main area. After a successful cross-version navigation, Tree opens in the destination session's right sidebar. Existing unarchive and running-session safeguards remain in use.
+- The narrow view has a compact toolbar and retains pan, zoom and center controls. Hiding the tab unmounts the canvas and cleans up its listeners; showing it again uses the shared cache and restores a viewport remembered separately from the full page.
+- Better Sidebar is an optional client service. Standalone Tree continues working when it is absent, disabled or enabled later. Disabling the service removes the registration. No npm runtime dependency is added.
+- Match Better Sidebar to your host: 0.28.0 requires DSH 0.2.1-rc.1+, while DSH 0.2.0-rc.2 uses 0.26.1. This integration does not install or upgrade other plugins.
+
+Component, lifecycle and navigation regression tests cover this integration. These mocked tests do not replace real UI verification for each DSH / Better Sidebar version combination.
+
 ## Jump rules
 
 - **A turn inside the version you are reading**: the Chat tab opens, the conversation scrolls to that turn and it flashes — the session is not reloaded, and no archive flag changes.
