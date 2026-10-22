@@ -50,19 +50,9 @@ Switch the conversation panel to Tree and the whole family is drawn on one canva
 
 ## Optional: Tree in Better Sidebar
 
-With [DSH-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) enabled, choose **Tree** from the right sidebar's `+` menu. No Better Sidebar patch is needed. This does not replace the left session list, and the original full-size conversation Tree tab remains available.
+Enable a compatible [DSH-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) version, then choose **Tree** from the right sidebar’s `+` menu. The original conversation Tree remains available, with or without Better Sidebar.
 
-- Both surfaces share the graph, cache, filters and branch actions; there is no second session store.
-- Selecting a node opens its chat in the main area. After a successful cross-version navigation, Tree opens in the destination session's right sidebar. Existing unarchive and running-session safeguards remain in use.
-- The narrow view has a compact toolbar and retains pan, zoom and center controls. Hiding the tab unmounts the canvas and cleans up its listeners; showing it again uses the shared cache and restores a viewport remembered separately from the full page.
-- Better Sidebar is an optional client service. Standalone Tree continues working when it is absent, disabled or enabled later. Disabling the service removes the registration. No npm runtime dependency is added.
-- Cross-session navigation waits for the destination sidebar surface to be ready, not merely selected (notably DSH 0.2.1-rc.2 + Better Sidebar 0.28.0). A newer navigation, leaving the destination, or disabling the integration cancels the pending follow. Surface readiness is capped at 5 seconds after selection, and the navigation intent at 15 seconds overall; failures are logged and shown on the next visible Tree sidebar, with a manual `+` → **Tree** retry. Older hosts without the read-only readiness probe only retry the specific pre-mount error.
-- Match Better Sidebar to your host: 0.28.0 requires DSH 0.2.1-rc.1+, while DSH 0.2.0-rc.2 uses 0.26.1. This integration does not install or upgrade other plugins.
-
-Component, lifecycle and navigation regression tests cover this integration. These mocked tests do not replace real UI verification for each DSH / Better Sidebar version combination.
-
-This `feat/better-sidebar-minimal` branch isolates the optional integration. The conversation Tree’s shared navigation, archive and 400ms reinforcement helpers remain unchanged. The exploratory branch is `feat/better-sidebar-tree`. This split has not been UI-retested; the archived A→B→A cache/collection issue remains unresolved. Sidebar cancellation suppresses later navigation/Tree opens, does not undo a completed unarchive, and does not change upstream turn-jump retries.
-
+Automated tests pass, but this branch has not been UI-retested; archived-branch round trips still need verification.
 
 ## Jump rules
 
