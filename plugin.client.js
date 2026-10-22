@@ -627,7 +627,8 @@ function ringFor(versions, sessionId, turn) {
  * target is activated through the host route before opening. Ghosts (deleted
  * versions) are never openable.
  */
-async function openVersionTarget(sessions, v) {
+async function openVersionTarget(sessions, v, isCurrent) {
+  if (isCurrent && !isCurrent()) return;
   if (!v || v.deleted || !sessions) return;
   remoteLog('info', 'open: ' + v.sessionId + ' archived=' + v.archived + (sessions.unarchive ? ' (workspace unarchive available)' : ''));
   if (v.archived) {
@@ -646,6 +647,7 @@ async function openVersionTarget(sessions, v) {
         remoteLog('warn', 'could not bring the version back out:', e && e.message ? e.message : e);
       }
     }
+    if (isCurrent && !isCurrent()) return;
     if (!unarchived) {
       try {
         await mutate({ action: 'activate', sessionId: v.sessionId });
@@ -654,9 +656,10 @@ async function openVersionTarget(sessions, v) {
         remoteLog('warn', 'could not unarchive the version through the host either:', e && e.message ? e.message : e);
       }
     }
+    if (isCurrent && !isCurrent()) return;
     treeStore.invalidate();
   }
-  openWhenListed(sessions, v.sessionId);
+  return openWhenListed(sessions, v.sessionId, isCurrent);
 }
 
 function collectLeftVersion(sessions, left, target, versions) {
@@ -695,9 +698,9 @@ function collectLeftVersion(sessions, left, target, versions) {
  * altogether. If retention is never reported (older hosts keep no such field), a
  * bounded wait collects anyway rather than never.
  */
-function collectAfterSwitch(sessions, left, target, versions) {
+function collectAfterSwitch(sessions, left, target, versions, isCurrent) {
   if (!left || left === target) return;
-  const collect = function () { collectLeftVersion(sessions, left, target, versions); };
+  const collect = function () { if (!isCurrent || isCurrent()) collectLeftVersion(sessions, left, target, versions); };
   const retained = function () {
     const list = sessions && typeof sessions.list === 'function' ? sessions.list() : null;
     if (!list || typeof list.getSnapshot !== 'function') return true;
@@ -740,6 +743,10 @@ function sessionNavigator(ctx) {
   // Every navigation takes a token; a newer one invalidates the retries of an older
   // one, so a stale attempt can never drag the reader back to a version they left.
   let navigationToken = 0;
+  let cancelIntent = function () {};
+  if (ctx && typeof ctx.effect === 'function') ctx.effect(function () {
+    return function () { navigationToken++; cancelIntent(); };
+  });
   function service(name) {
     return ctx && typeof ctx.get === 'function' ? ctx.get(name) : undefined;
   }
@@ -748,6 +755,12 @@ function sessionNavigator(ctx) {
    * snapshot carries no retention information.
    */
   function mainSessionId() {
+    // Retention includes background sidebar views, not just the selected chat.
+    // An authoritative undefined means a global panel, NOT unknown state.
+    const sidebar = service('sidebarRight');
+    if (sidebar && sidebar.mounted && typeof sidebar.mounted.getSnapshot === 'function') {
+      return sidebar.mounted.getSnapshot() || '';
+    }
     const sessions = service('sessions');
     const list = sessions && sessions.list;
     if (!list || typeof list.getSnapshot !== 'function') return null;
@@ -770,6 +783,46 @@ function sessionNavigator(ctx) {
       return sessions && sessions.list;
     },
     mainSession: mainSessionId,
+    beginNavigation: function (target) {
+      cancelIntent();
+      const token = ++navigationToken;
+      const initial = mainSessionId();
+      let reached = initial === target;
+      let cancelled = false;
+      let timer;
+      let stop = function () {};
+      const listeners = new Set();
+      function cancel() {
+        if (cancelled) return;
+        cancelled = true;
+        clearTimeout(timer);
+        stop();
+        listeners.forEach(function (f) { f(); });
+        listeners.clear();
+      }
+      const valid = function () { return !cancelled && token === navigationToken; };
+      valid.cancel = cancel;
+      valid.onCancel = function (f) {
+        if (!valid()) { f(); return function () {}; }
+        listeners.add(f);
+        return function () { listeners.delete(f); };
+      };
+      cancelIntent = cancel;
+      const sidebar = service('sidebarRight');
+      const feed = sidebar && sidebar.mounted;
+      if (feed && typeof feed.subscribe === 'function') {
+        stop = feed.subscribe(function () {
+          const current = mainSessionId();
+          if (current === target) reached = true;
+          else if (reached || current !== initial) cancel();
+        });
+        if (cancelled) stop();
+      }
+      // Bound the entire async intent, including unarchive/catalogue and rail
+      // retries. Cancellation does not undo an already completed unarchive.
+      if (!cancelled) timer = setTimeout(cancel, 15000);
+      return valid;
+    },
     /**
      * Run `callback` once the main view really shows `sessionId`.
      *
@@ -779,11 +832,13 @@ function sessionNavigator(ctx) {
      * report retention cannot be asked, so it keeps the immediate behaviour rather
      * than guessing; the callback always runs, at the latest after three seconds.
      */
-    whenMain: function (sessionId, callback) {
+    whenMain: function (sessionId, callback, isCurrent) {
+      if (isCurrent && !isCurrent()) return;
       const current = mainSessionId();
       if (current === null || current === sessionId) { callback(); return; }
       let tries = 0;
       const poll = function () {
+        if (isCurrent && !isCurrent()) return;
         tries += 1;
         if (mainSessionId() === sessionId || tries >= 25) { callback(); return; }
         setTimeout(poll, 120);
@@ -823,8 +878,8 @@ function sessionNavigator(ctx) {
      * reader back to the version they had already left — which is exactly what
      * "fast clicking still jumps to the new conversation" was.
      */
-    open: function (sessionId) {
-      const token = ++navigationToken;
+    open: function (sessionId, isCurrent) {
+      const token = isCurrent ? navigationToken : ++navigationToken;
       const reinforce = function () {
         // One idempotent re-issue after the dust settles. 0.1.7's right sidebar
         // re-syncs its retained session views when the main session changes, and a
@@ -833,7 +888,7 @@ function sessionNavigator(ctx) {
         // the main view never lands on the target. openSession to the same target is
         // harmless, so a second call after the race re-establishes it. A newer click
         // bumps the token and cancels this.
-        if (token !== navigationToken) return;
+        if (token !== navigationToken || (isCurrent && !isCurrent())) return;
         const workspace = service('uiWorkspace');
         if (workspace && typeof workspace.openSession === 'function') {
           try { workspace.openSession(sessionId); }
@@ -842,7 +897,7 @@ function sessionNavigator(ctx) {
       };
       const attempt = function (left) {
         // Superseded by a later click: this navigation is stale, drop it.
-        if (token !== navigationToken) return false;
+        if (token !== navigationToken || (isCurrent && !isCurrent())) return false;
         const workspace = service('uiWorkspace');
         if (workspace && typeof workspace.openSession === 'function') {
           try {
@@ -877,15 +932,32 @@ function sessionNavigator(ctx) {
   };
 }
 
-function openWhenListed(sessions, sessionId) {
+function openWhenListed(sessions, sessionId, isCurrent) {
+  if (isCurrent && !isCurrent()) return;
   const list = sessions.list ? sessions.list() : null;
-  if (!list || typeof list.getSnapshot !== 'function') { sessions.open(sessionId); return; }
-  if (list.getSnapshot().byId[sessionId] !== undefined) { sessions.open(sessionId); return; }
-  const stop = list.subscribe(function () {
-    if (list.getSnapshot().byId[sessionId] !== undefined) {
+  const known = function () { return !list || typeof list.getSnapshot !== 'function' || list.getSnapshot().byId[sessionId] !== undefined; };
+  if (known()) { sessions.open(sessionId, isCurrent); return; }
+  return new Promise(function (resolve) {
+    let done = false;
+    let stop = function () {};
+    let stopCancel = function () {};
+    let timer;
+    function finish(open) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
       stop();
-      sessions.open(sessionId);
+      stopCancel();
+      if (open && (!isCurrent || isCurrent())) sessions.open(sessionId, isCurrent);
+      resolve();
     }
+    stop = list.subscribe(function () { if (known()) finish(true); });
+    if (done) stop();
+    if (!done && isCurrent && isCurrent.onCancel) stopCancel = isCurrent.onCancel(function () { finish(false); });
+    if (!done && isCurrent) timer = setTimeout(function () {
+      remoteLog('warn', 'version did not appear in the session catalogue: ' + sessionId);
+      finish(false);
+    }, 3000);
   });
 }
 
@@ -1457,7 +1529,8 @@ function showChat() {
  * succeed. The row itself is what decides when to flash, and its absence is what
  * retries.
  */
-function flashTurn(sessionId, turn, tries, nextRailAt) {
+function flashTurn(sessionId, turn, tries, nextRailAt, isCurrent) {
+  if (isCurrent && !isCurrent()) return;
   const g = realGlobal();
   if (!g || !g.document) return;
   const el = g.document.querySelector(
@@ -1475,10 +1548,10 @@ function flashTurn(sessionId, turn, tries, nextRailAt) {
   if (tries <= railAt && tries > railAt - 4 * 8) {
     const result = jumpViaRail(turn);
     remoteLog('info', 'jump: ' + sessionId + ' turn ' + turn + ' via ' + result.via);
-    if (tries > 0) setTimeout(function () { flashTurn(sessionId, turn, tries - 1, railAt - 8); }, 160);
+    if (tries > 0) setTimeout(function () { flashTurn(sessionId, turn, tries - 1, railAt - 8, isCurrent); }, 160);
     return;
   }
-  if (tries > 0) setTimeout(function () { flashTurn(sessionId, turn, tries - 1, railAt); }, 160);
+  if (tries > 0) setTimeout(function () { flashTurn(sessionId, turn, tries - 1, railAt, isCurrent); }, 160);
 }
 
 /**
@@ -1566,13 +1639,14 @@ function jumpViaRail(turn) {
  * turn short of the target, so trusting it here lit up the wrong card (see
  * watchReading for when the pin gives way).
  */
-function jumpToTurn(sessionId, turn) {
+function jumpToTurn(sessionId, turn, isCurrent) {
+  if (isCurrent && !isCurrent()) return;
   reading.pin = { sessionId: sessionId, turn: turn };
   reading.sessionId = sessionId;
   reading.turn = turn;
   rememberReading();
   readingNotify();
-  flashTurn(sessionId, turn, 60);
+  flashTurn(sessionId, turn, 60, undefined, isCurrent);
 }
 
 /**
@@ -3409,36 +3483,47 @@ return {
         // the app has switched. Ask the app instead — the session list marks what
         // the main view is retaining — and fall back to the prop where that signal
         // does not exist.
-        const revealSidebar = props.prepareSidebarReveal ? props.prepareSidebarReveal(v.sessionId) : null;
+        const isCurrent = sessions.beginNavigation ? sessions.beginNavigation(v.sessionId) : function () { return true; };
+        const revealSidebar = props.prepareSidebarReveal ? props.prepareSidebarReveal(v.sessionId, isCurrent.cancel) : null;
         const onScreen = sessions.mainSession ? sessions.mainSession() : null;
         const alreadyOnScreen = onScreen !== null ? v.sessionId === onScreen : v.sessionId === sessionId;
         if (alreadyOnScreen) {
           remoteLog('info', 'click: already on screen (' + (onScreen !== null ? 'app says ' + onScreen : 'prop') + ') — no switch');
           showChat();
           if (revealSidebar) revealSidebar();
-          if (typeof node.turn === 'number' && node.turn > 0) jumpToTurn(node.sessionId, node.turn);
+          if (typeof node.turn === 'number' && node.turn > 0) jumpToTurn(node.sessionId, node.turn, isCurrent);
           return;
         }
         // Anything else is a swap: a version that is collected in the tree comes
         // back out, and the one you were reading goes in — the latter only once the
         // app is really showing the target (see collectAfterSwitch: collecting
         // first is what made a second click land on the session you had just left).
-        if (v.archived === true) collectAfterSwitch(sessions, sessionId, v.sessionId, versions);
-        openVersionTarget(sessions, v);
+        // Restore can be genuinely asynchronous. Do not start the reveal
+        // deadline before the unarchive and catalogue wait have completed.
         // Open the Chat tab once the app is really on the target. Flipping to it in
         // this same tick showed the session you were leaving until the switch landed
         // — the report "it flashes the new conversation, then jumps to the target".
         const reveal = function () {
+          if (!isCurrent()) return;
           // whenMain has a bounded timeout: never reveal a sidebar for a
           // failed or superseded navigation that did not reach its target.
           const current = sessions.mainSession ? sessions.mainSession() : null;
           if (current !== null && current !== v.sessionId) return;
+          // A stale slot's sessionId is not necessarily the version being left.
+          if (v.archived === true) {
+            const left = onScreen || sessionId;
+            if (current === null) collectAfterSwitch(sessions, left, v.sessionId, versions, isCurrent);
+            else collectLeftVersion(sessions, left, v.sessionId, versions);
+          }
           showChat();
           if (revealSidebar) revealSidebar();
-          if (typeof node.turn === 'number' && node.turn > 0) jumpToTurn(node.sessionId, node.turn);
+          if (typeof node.turn === 'number' && node.turn > 0) jumpToTurn(node.sessionId, node.turn, isCurrent);
         };
-        if (sessions.whenMain) sessions.whenMain(v.sessionId, reveal);
-        else reveal();
+        openVersionTarget(sessions, v, isCurrent).then(function () {
+          if (!isCurrent()) return;
+          if (sessions.whenMain) sessions.whenMain(v.sessionId, reveal, isCurrent);
+          else reveal();
+        }).catch(function (error) { remoteLog('warn', 'version navigation failed: ' + (error && error.message ? error.message : error)); });
       }
 
       /**
@@ -4117,6 +4202,7 @@ return {
       let active = true;
       let generation = 0;
       let pending = null;
+      let cancelNavigation = function () {};
       let handoffError = '';
       const errorListeners = new Set();
       const g = realGlobal();
@@ -4150,7 +4236,7 @@ return {
         pending = request;
         const selected = mounted.getSnapshot();
         let reached = selected === sessionId;
-        function fail(message) { cancelPending(); publishError(message); }
+        function fail(message) { cancelPending(); cancelNavigation(); publishError(message); }
         function check() {
           request.frame = 0;
           if (!active || token !== generation || pending !== request) return;
@@ -4202,6 +4288,7 @@ return {
       scope.effect(function () { return function () {
         active = false;
         generation++;
+        cancelNavigation();
         cancelPending();
         errorListeners.clear();
       }; });
@@ -4218,7 +4305,7 @@ return {
             // is expected. Closing/hiding it while still on that session is not.
             const controller = scope.get('sidebarRight');
             const current = controller && controller.mounted && controller.mounted.getSnapshot();
-            if (current === owner) { generation++; cancelPending(); }
+            if (current === owner) { generation++; cancelNavigation(); cancelPending(); }
           }
           if (!props.visible) cancelIfOwnerStillSelected();
           return cancelIfOwnerStillSelected;
@@ -4234,7 +4321,9 @@ return {
             key: owner,
             sessionId: owner,
             compact: true,
-            prepareSidebarReveal: function (sessionId) {
+            prepareSidebarReveal: function (sessionId, cancel) {
+              cancelNavigation();
+              cancelNavigation = cancel || function () {};
               const token = ++generation;
               cancelPending();
               publishError('');

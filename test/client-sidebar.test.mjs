@@ -40,11 +40,16 @@ test('Better Sidebar is optional, supports late activation and disposes its regi
   assert.equal(fiber.state, 2, 'disabling Better Sidebar does not disable standalone Tree');
 });
 
-async function mount(t, { archived = false, holdNavigation = false, delayedSurface = false, legacyController = false, openError = null, eagerSubscription = false } = {}) {
+async function mount(t, { archived = false, holdNavigation = false, delayedSurface = false, legacyController = false, openError = null, eagerSubscription = false, deferredUnarchive = false, staleRetention = false, holdCatalogue = false } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body><button role="tab" aria-selected="true">Chat</button><div id="root"></div></body></html>', { url: 'https://tree.test/', pretendToBeVisual: true });
   let current = 'root';
   let ready = 'root';
   let attempts = 0;
+  let releaseUnarchive;
+  const unarchiveGate = deferredUnarchive ? new Promise(resolve => { releaseUnarchive = resolve; }) : Promise.resolve();
+  const catalogued = new Set(archived && deferredUnarchive ? ['root', 'other'] : ['root', 'other', 'branch']);
+  const listListeners = new Set();
+  const addCatalogue = id => { catalogued.add(id); listListeners.forEach(f => f()); };
   const mountedListeners = new Set();
   const select = id => { current = id; if (!delayedSurface) ready = id; mountedListeners.forEach(f => f()); };
   let requests = 0;
@@ -71,8 +76,8 @@ async function mount(t, { archived = false, holdNavigation = false, delayedSurfa
   runInNewContext(bundle, { window: dom.window, document: dom.window.document, console, setTimeout: dom.window.setTimeout.bind(dom.window), clearTimeout: dom.window.clearTimeout.bind(dom.window), requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window), cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window) });
   const services = {
     slots: { inject: (_name, f) => f(), register: (spec, component) => { if (spec.name === 'conversation.view') fullView = component; return () => {}; } },
-    sessions: { list: { subscribe: () => () => {}, getSnapshot: () => ({ byId: Object.fromEntries(versions.map(v => [v.sessionId, { id: v.sessionId, retainedBy: v.sessionId === current ? ['main'] : [] }])) }) } },
-    uiWorkspace: { unarchiveSession: async id => { restored.push(id); }, openSession: id => { opened.push(id); if (!holdNavigation) select(id); } },
+    sessions: { list: { subscribe: f => { listListeners.add(f); return () => listListeners.delete(f); }, getSnapshot: () => ({ byId: Object.fromEntries(versions.filter(v => catalogued.has(v.sessionId)).map(v => [v.sessionId, { id: v.sessionId, retainedBy: v.sessionId === current ? ['main'] : staleRetention && v.sessionId === 'root' ? ['sidebar'] : [] }])) }) } },
+    uiWorkspace: { unarchiveSession: async id => { restored.push(id); await unarchiveGate; if (!holdCatalogue) addCatalogue(id); }, openSession: id => { opened.push(id); if (!holdNavigation) select(id); } },
     sidebarRight: { mounted: { getSnapshot: () => current, subscribe: f => { mountedListeners.add(f); if (eagerSubscription) f(); return () => mountedListeners.delete(f); } },
       ...(!legacyController ? { commandTarget: () => ready === current ? { sessionId: current } : undefined } : {}) },
     betterSidebar: { registerTab: value => { tab = value; return () => { tab = null; }; }, openTab: (seed, scope) => { attempts++; if (openError) throw new Error(openError); if (ready !== current) throw new Error('sidebarRight: no session surface is mounted'); sidebarOpened.push({ seed, scope }); } },
@@ -96,7 +101,7 @@ async function mount(t, { archived = false, holdNavigation = false, delayedSurfa
     });
   };
   const renderFull = async () => act(async () => { root.render(React.createElement(fullView, { sessionId: 'root' })); await tick(); });
-  return { dom, render, renderFull, click, setMain: select, mountSurface: id => { ready = id; }, attempts: () => attempts, listeners: () => mountedListeners.size,
+  return { dom, render, renderFull, click, setMain: select, selected: () => current, listObservers: () => listListeners.size, releaseUnarchive: () => releaseUnarchive?.(), addCatalogue, mountSurface: id => { ready = id; }, attempts: () => attempts, listeners: () => mountedListeners.size,
     disable: () => disposers.splice(0).reverse().forEach(f => f()), unmount: async () => act(async () => root.render(null)), opened, restored, sidebarOpened, posts, requests: () => requests };
 }
 
@@ -185,11 +190,11 @@ test('a selected destination waits for its adopted surface, not just mounted sel
   await h.click('branch');
   await frames();
   assert.equal(h.attempts(), 0, 'do not enqueue an open before a surface exists');
-  assert.equal(h.listeners(), 1);
+  assert.equal(h.listeners(), 2);
   h.mountSurface('branch');
   await frames();
   assert.equal(h.sidebarOpened.length, 1);
-  assert.equal(h.listeners(), 0);
+  assert.equal(h.listeners(), 1, 'only the bounded navigation intent remains');
 });
 
 test('rapid A to B navigation cancels the pending A handoff', async t => {
@@ -200,7 +205,7 @@ test('rapid A to B navigation cancels the pending A handoff', async t => {
   h.mountSurface('other');
   await frames();
   assert.deepEqual(h.sidebarOpened.map(x => x.scope.sessionId), ['other']);
-  assert.equal(h.listeners(), 0);
+  assert.equal(h.listeners(), 1, 'only the bounded navigation intent remains');
 });
 
 test('leaving a selected destination cancels instead of reopening it on return', async t => {
@@ -231,7 +236,7 @@ test('source unmount on session switch preserves handoff; destination unmount ca
   await h.render(true);
   await h.click('branch');
   await h.unmount(); // old source view leaves as target is selected
-  assert.equal(h.listeners(), 1);
+  assert.equal(h.listeners(), 2);
   await h.render(true, 'branch');
   await h.unmount(); // explicitly close the destination tree before ready
   h.mountSurface('branch');
@@ -280,7 +285,7 @@ test('an eagerly notifying mounted observable cannot leak its subscription', asy
   await h.click('branch');
   await frames();
   assert.equal(h.sidebarOpened.length, 1);
-  assert.equal(h.listeners(), 0);
+  assert.equal(h.listeners(), 1, 'only the bounded navigation intent remains');
 });
 
 test('hiding the destination while waiting cancels the handoff', async t => {
@@ -303,7 +308,102 @@ test('main to A, A to B, and B back to main follow each newly mounted surface', 
     h.mountSurface(destination);
     await frames();
     assert.equal(h.sidebarOpened.at(-1)?.scope.sessionId, destination);
-    assert.equal(h.listeners(), 0);
+    assert.equal(h.listeners(), 1, 'only the bounded navigation intent remains');
   }
   assert.deepEqual(h.sidebarOpened.map(x => x.scope.sessionId), ['branch', 'other', 'root']);
+});
+
+
+test('cold archived target survives async restore and background-retained source metadata', async t => {
+  const h = await mount(t, { archived: true, deferredUnarchive: true, staleRetention: true, delayedSurface: true });
+  await h.render(true);
+  await h.click('branch');
+  assert.deepEqual(h.opened, [], 'restore has not resolved');
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 3200)); });
+  assert.deepEqual(h.opened, [], 'reveal timeout must not run ahead of restore');
+  assert.equal(h.posts.filter(p => p.action === 'demote').length, 0, 'do not archive source during restore');
+  await act(async () => { h.releaseUnarchive(); await tick(); });
+  assert.equal(h.selected(), 'branch');
+  await h.render(true, 'branch');
+  h.mountSurface('branch');
+  await frames();
+  assert.deepEqual(h.sidebarOpened.map(x => x.scope.sessionId), ['branch']);
+  assert.deepEqual(h.posts.filter(p => p.action === 'demote').map(p => p.sessionId), ['root']);
+});
+
+test('leaving for Plugins before async restore resolves cannot navigate or reveal later', async t => {
+  const h = await mount(t, { archived: true, deferredUnarchive: true, staleRetention: true });
+  await h.render(true);
+  await h.click('branch');
+  h.setMain(undefined); // native mounted clears, retained old sessions remain
+  await h.unmount();
+  await act(async () => { h.releaseUnarchive(); await new Promise(resolve => setTimeout(resolve, 650)); });
+  assert.equal(h.selected(), undefined);
+  assert.deepEqual(h.opened, []);
+  assert.deepEqual(h.sidebarOpened, []);
+  assert.equal(h.posts.filter(p => p.action === 'demote').length, 0);
+  assert.equal(h.listeners(), 0);
+});
+
+test('leaving after archived navigation lands cancels the original 400ms reinforcement', async t => {
+  const h = await mount(t, { archived: true, deferredUnarchive: true, staleRetention: true });
+  await h.render(true);
+  await h.click('branch');
+  await act(async () => { h.releaseUnarchive(); await tick(); });
+  assert.equal(h.opened.length, 1);
+  h.setMain(undefined);
+  await h.unmount();
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 650)); });
+  assert.equal(h.selected(), undefined, 'Plugins must remain selected');
+  assert.equal(h.opened.length, 1, 'no reinforcement navigation after departure');
+  assert.equal(h.listeners(), 0);
+});
+
+test('a newer click supersedes an older unresolved archive restoration', async t => {
+  const h = await mount(t, { archived: true, deferredUnarchive: true });
+  await h.render(true);
+  await h.click('branch');
+  await h.click('other');
+  await act(async () => { h.releaseUnarchive(); await new Promise(resolve => setTimeout(resolve, 500)); });
+  assert.equal(h.selected(), 'other');
+  assert.ok(h.opened.every(x => x === 'other'));
+  assert.deepEqual(h.sidebarOpened.map(x => x.scope.sessionId), ['other']);
+});
+
+test('leaving during the post-restore catalogue wait releases the subscription', async t => {
+  const h = await mount(t, { archived: true, deferredUnarchive: true, holdCatalogue: true });
+  await h.render(true);
+  const baselineObservers = h.listObservers();
+  await h.click('branch');
+  await act(async () => { h.releaseUnarchive(); await tick(); });
+  assert.deepEqual(h.opened, []);
+  h.setMain(undefined);
+  await act(async () => { h.addCatalogue('branch'); await tick(); });
+  await frames();
+  assert.deepEqual(h.opened, []);
+  assert.deepEqual(h.sidebarOpened, []);
+  assert.equal(h.listeners(), 0);
+  assert.equal(h.listObservers(), baselineObservers, 'catalogue observer was removed');
+});
+
+
+test('a stale graph scope does not archive the wrong source after restoration', async t => {
+  const h = await mount(t, { archived: true, deferredUnarchive: true, staleRetention: true });
+  h.setMain('other');
+  await h.render(true, 'root'); // retained old Tree slot, actual selected chat is other
+  await h.click('branch');
+  await act(async () => { h.releaseUnarchive(); await tick(); });
+  assert.deepEqual(h.posts.filter(p => p.action === 'demote').map(p => p.sessionId), ['other']);
+  assert.deepEqual(h.sidebarOpened.map(x => x.scope.sessionId), ['branch']);
+});
+
+test('disabling Tree while unarchive is pending cancels all later navigation', async t => {
+  const h = await mount(t, { archived: true, deferredUnarchive: true });
+  await h.render(true);
+  await h.click('branch');
+  h.disable();
+  await act(async () => { h.releaseUnarchive(); await tick(); });
+  assert.deepEqual(h.opened, []);
+  assert.deepEqual(h.sidebarOpened, []);
+  assert.equal(h.listeners(), 0);
 });
