@@ -53,7 +53,7 @@
 
 启用兼容版本的 [DSH-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) 后，从右侧栏 `+` → **Tree** 打开。原会话 Tree 页面保留；不启用 Better Sidebar 也可照常使用。
 
-自动化测试已通过，但本分支尚未实机复测，归档分支往返仍需验证。
+2026-10-22 在 macOS 隔离 Chrome 中通过 17 项定向 UI 复测，含三轮归档往返；自动化测试 183 项通过、1 项既有跳过。已知：禁用 Better Sidebar 后仍可出现 `settings.get` 405。
 
 ## 跳转规则
 

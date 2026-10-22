@@ -52,7 +52,7 @@ Switch the conversation panel to Tree and the whole family is drawn on one canva
 
 Enable a compatible [DSH-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) version, then choose **Tree** from the right sidebar’s `+` menu. The original conversation Tree remains available, with or without Better Sidebar.
 
-Automated tests pass, but this branch has not been UI-retested; archived-branch round trips still need verification.
+On 2026-10-22, 17 targeted UI checks passed in isolated Chrome on macOS, including three archived-branch round trips; automated tests: 183 passed, 1 existing skip. Known issue: `settings.get` 405 can still occur after disabling Better Sidebar.
 
 ## Jump rules
 
