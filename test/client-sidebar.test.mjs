@@ -52,7 +52,8 @@ async function mount(t, { archived = false, holdNavigation = false, delayedSurfa
   const listListeners = new Set();
   const addCatalogue = id => { catalogued.add(id); listListeners.forEach(f => f()); };
   const mountedListeners = new Set();
-  const select = id => { current = id; if (!delayedSurface) ready = id; mountedListeners.forEach(f => f()); };
+  let onSelection = () => {};
+  const select = id => { current = id; if (!delayedSurface) ready = id; mountedListeners.forEach(f => f()); onSelection(id); };
   const archiveState = new Set(archived ? ['branch'] : []);
   let cachedTree;
   let requests = 0;
@@ -80,6 +81,7 @@ async function mount(t, { archived = false, holdNavigation = false, delayedSurfa
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
   }
   const { createRoot } = await import('react-dom/client');
+  const { flushSync } = await import('react-dom');
   const root = createRoot(dom.window.document.getElementById('root'));
   let plugin, tab, fullView;
   dom.window.__ModuleLoader__ = { load: ({ factory }) => { plugin = factory(() => React); } };
@@ -102,8 +104,10 @@ async function mount(t, { archived = false, holdNavigation = false, delayedSurfa
     for (const [key, desc] of old) { if (desc) Object.defineProperty(globalThis, key, desc); else delete globalThis[key]; }
   });
   const render = async (visible, sessionId = 'root') => act(async () => { root.render(React.createElement(tab.component, { visible, scope: { sessionId } })); await tick(); });
-  const click = async id => {
-    const card = dom.window.document.querySelector('.mtx-card[data-id="' + id + '#t1"]');
+  const renderViewsSync = views => flushSync(() => root.render(React.createElement(React.Fragment, null, ...views.map(view => React.createElement('div', { key: view.key, 'data-test-sidebar': view.key }, React.createElement(tab.component, { visible: view.visible !== false, scope: { sessionId: view.sessionId } }))))));
+  const renderViews = async views => act(async () => { renderViewsSync(views); await tick(); });
+  const click = async (id, viewKey) => {
+    const card = dom.window.document.querySelector((viewKey ? '[data-test-sidebar="' + viewKey + '"] ' : '') + '.mtx-card[data-id="' + id + '#t1"]');
     assert.ok(card);
     await act(async () => {
       card.dispatchEvent(new dom.window.MouseEvent('pointerdown', { bubbles: true, button: 0 }));
@@ -113,7 +117,7 @@ async function mount(t, { archived = false, holdNavigation = false, delayedSurfa
     });
   };
   const renderFull = async () => act(async () => { root.render(React.createElement(fullView, { sessionId: 'root' })); await tick(); });
-  return { dom, render, renderFull, click, archivedIds: () => [...archiveState], setMain: select, selected: () => current, listObservers: () => listListeners.size, releaseUnarchive: () => releaseUnarchive?.(), addCatalogue, mountSurface: id => { ready = id; }, attempts: () => attempts, listeners: () => mountedListeners.size,
+  return { dom, render, renderFull, click, renderViews, renderViewsSync, onSelection: fn => { onSelection = fn; }, archivedIds: () => [...archiveState], setMain: select, selected: () => current, listObservers: () => listListeners.size, releaseUnarchive: () => releaseUnarchive?.(), addCatalogue, mountSurface: id => { ready = id; }, attempts: () => attempts, listeners: () => mountedListeners.size,
     disable: () => disposers.splice(0).reverse().forEach(f => f()), unmount: async () => act(async () => root.render(null)), opened, restored, sidebarOpened, posts, requests: () => requests };
 }
 
@@ -500,3 +504,67 @@ test('legacy host without native archive feed collects selected source despite i
   assert.equal(h.selected(), 'root');
   assert.deepEqual(h.archivedIds(), ['branch']);
 });
+
+
+for (const replacement of ['unmount', 'visibility cleanup', 'hide cleanup', 'hidden sibling mount']) {
+  test('return navigation survives stale target instance ' + replacement + ' before arrival', async t => {
+    const h = await mount(t, { archived: true, statefulArchive: true });
+    const a = { key: 'old-A', sessionId: 'root' };
+    const b = { key: 'B', sessionId: 'branch' };
+    await h.renderViews([a]);
+    await h.click('branch', 'old-A');
+    await h.renderViews([{ ...a, visible: replacement === 'hide cleanup' }, b]);
+    h.onSelection(id => {
+      if (id !== 'root') return;
+      const targetViews = replacement === 'unmount' ? [b]
+        : replacement === 'visibility cleanup' ? [a, b]
+        : replacement === 'hide cleanup' ? [{ ...a, visible: false }, b]
+        : [{ ...a, visible: false }, b, { key: 'unowned-A', sessionId: 'root', visible: false }];
+      h.renderViewsSync(targetViews);
+    });
+    await h.click('root', 'B');
+    assert.equal(h.selected(), 'root');
+    assert.deepEqual(h.archivedIds(), ['branch']);
+    assert.deepEqual(h.posts.filter(p => p.action === 'demote').map(p => p.sessionId), ['root', 'branch']);
+    assert.equal(h.sidebarOpened.at(-1).scope.sessionId, 'root');
+  });
+}
+
+for (const close of ['unmount', 'hide']) {
+  test('the initiating instance can still ' + close + ' and cancel its own pending restore', async t => {
+    const h = await mount(t, { archived: true, deferredUnarchive: true, statefulArchive: true });
+    await h.render(true);
+    await h.click('branch');
+    if (close === 'unmount') await h.unmount();
+    else await h.render(false);
+    await act(async () => { h.releaseUnarchive(); await tick(); });
+    await frames();
+    assert.equal(h.selected(), 'root');
+    assert.deepEqual(h.opened, []);
+    assert.deepEqual(h.sidebarOpened, []);
+    assert.deepEqual(h.posts.filter(p => p.action === 'demote'), []);
+    assert.equal(h.listeners(), 0);
+  });
+
+  test('a newly attached destination instance can ' + close + ' after stale target cleanup', async t => {
+    const h = await mount(t, { archived: true, statefulArchive: true, delayedSurface: true });
+    const a = { key: 'old-A', sessionId: 'root' };
+    const b = { key: 'B', sessionId: 'branch' };
+    const fresh = { key: 'new-A', sessionId: 'root' };
+    await h.renderViews([a]);
+    await h.click('branch', 'old-A');
+    h.mountSurface('branch');
+    await frames();
+    await h.renderViews([{ ...a, visible: false }, b]);
+    h.onSelection(id => { if (id === 'root') h.renderViewsSync([b, fresh]); });
+    await h.click('root', 'B');
+    assert.deepEqual(h.archivedIds(), ['branch']);
+    assert.equal(h.listeners(), 2, 'navigation and pending surface wait are both live');
+    await h.renderViews(close === 'unmount' ? [b] : [b, { ...fresh, visible: false }]);
+    h.mountSurface('root');
+    await frames();
+    assert.equal(h.selected(), 'root');
+    assert.deepEqual(h.sidebarOpened.map(x => x.scope.sessionId), ['branch']);
+    assert.equal(h.listeners(), 0);
+  });
+}

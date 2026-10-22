@@ -4204,10 +4204,11 @@ return {
       // Reuse the unmodified upstream navigator through a scoped host-service
       // proxy. Its restore, catalogue and 400ms reinforcement code stays intact;
       // only calls belonging to a cancelled SIDEBAR intent are suppressed.
-      function selectVersion(version, node, versions, owner) {
+      function selectVersion(version, node, versions, owner, origin) {
         cancelNavigation();
         cancelPending();
         const token = ++generation;
+        origin.navigationGeneration = token;
         publishError('');
         const controller = scope.get('sidebarRight');
         const mounted = controller && controller.mounted;
@@ -4325,6 +4326,7 @@ return {
         errorListeners.clear();
       }; });
       function SidebarTree(props) {
+        const instance = React.useRef({});
         const [, redraw] = React.useReducer(function (x) { return x + 1; }, 0);
         React.useEffect(function () {
           errorListeners.add(redraw);
@@ -4332,12 +4334,18 @@ return {
         }, []);
         const owner = props.scope && props.scope.sessionId;
         React.useEffect(function () {
+          const lifecycleGeneration = props.visible ? generation : null;
           function cancelIfOwnerStillSelected() {
             // A source canvas unmount during a successful cross-session switch
-            // is expected. Closing/hiding it while still on that session is not.
+            // is expected. A retained target's OLD effect can also clean up as
+            // that session returns: it must not cancel another instance's click.
+            // The source owns the generation it started; a newly mounted/shown
+            // destination owns only the generation of this effect lifecycle.
             const controller = scope.get('sidebarRight');
             const current = controller && controller.mounted && controller.mounted.getSnapshot();
-            if (current === owner) { generation++; cancelNavigation(); cancelPending(); }
+            if (current === owner && (instance.current.navigationGeneration === generation || lifecycleGeneration === generation)) {
+              generation++; cancelNavigation(); cancelPending();
+            }
           }
           if (!props.visible) cancelIfOwnerStillSelected();
           return cancelIfOwnerStillSelected;
@@ -4353,7 +4361,9 @@ return {
             key: owner,
             sessionId: owner,
             compact: true,
-            onVersionSelect: selectVersion,
+            onVersionSelect: function (version, node, versions, owner) {
+              selectVersion(version, node, versions, owner, instance.current);
+            },
           })
         );
       }
